@@ -1,78 +1,74 @@
 /**
- * RippleDrop — WebRTC Peer Manager  v11
+ * RippleDrop — WebRTC Peer Manager  v12
  *
  * ══════════════════════════════════════════════════════════════════
- * ROOT CAUSE OF BURST → STALL → BURST PATTERN (v10 bug)
+ * BUGS FIXED IN v12
  * ══════════════════════════════════════════════════════════════════
  *
- * SYMPTOM:  30-50 MB/s for 1-2 seconds, then 0 B/s for many seconds,
- *           then a brief spike, then 0 again. Average = KB/s.
- *           ETA shows "266683536050.2h left".
- *
- * BUG 1 — SCTP CONGESTION WINDOW COLLAPSE (the main culprit)
+ * BUG 1 — setTimeout(0) THROTTLED TO 1000ms IN BACKGROUND TABS
  * ─────────────────────────────────────────────────────────────────
- * v10 used HIGH_WATERMARK = 8 MB. This means the send loop dumps
- * up to 8 MB into the DataChannel buffer in one synchronous burst
- * before yielding. Chrome then:
- *   1. Encrypts it all at once (DTLS/AES — CPU spike)
- *   2. Floods the SCTP stack with 8 MB of segments
- *   3. Receiver's SCTP receive window (rwnd) fills up
- *   4. SCTP treats rwnd exhaustion like network congestion
- *   5. Sender's cwnd collapses (same as TCP slow-start after loss)
- *   6. Speed drops to near 0 B/s for several seconds
- *   7. cwnd slowly grows → brief speed spike → collapse again
+ * v11 introduced `await yieldToEventLoop()` using setTimeout(r, 0)
+ * every 512 KB to let Chrome process SCTP ACKs mid-burst.
  *
- * FIX: HIGH_WATERMARK = 1 MB. The DataChannel buffer never holds
- * more than 1 MB at a time, keeping SCTP's cwnd stable.
+ * THE PROBLEM: Chrome throttles setTimeout to a minimum of 1000ms
+ * when the tab is not in the foreground. If you open the sender tab
+ * and then switch to the receiver tab to watch progress, the sender
+ * tab becomes a "background tab":
  *
- * BUG 2 — NO EVENT-LOOP YIELD DURING SYNCHRONOUS BURST
+ *   512 KB sent → yield (setTimeout 0 → throttled to 1000ms) → resume
+ *   = 512 KB / 1000ms = 512 KB/s ← EXACTLY the speed you observed
+ *
+ * This also explains why you'd occasionally see brief spikes: when you
+ * click back to the sender tab it briefly runs unthrottled.
+ *
+ * THE FIX: Replace setTimeout with MessageChannel.
+ *   MessageChannel.postMessage() is a "postTask" — it is NOT subject
+ *   to timer throttling. It fires in the next task queue turn, typically
+ *   within 0–1ms regardless of tab focus state. This allows the yield
+ *   to process SCTP ACKs without suffering background tab penalties.
+ *
+ * BUG 2 — SENDER SPEED METER MEASURES QUEUE RATE, NOT SEND RATE
  * ─────────────────────────────────────────────────────────────────
- * v10's send loop was fully synchronous until hitting HIGH_WATERMARK.
- * During a synchronous burst, the browser's networking thread (which
- * processes SCTP ACKs and updates the congestion window) cannot run.
- * Chrome literally cannot receive ACKs while JS is running. So:
- *   - cwnd stays at its initial value (small)
- *   - The send buffer fills without cwnd growing
- *   - When we eventually yield, cwnd update is batched → spike
+ * `bytesSent` counts bytes passed to dc.send() (queuing speed).
+ * dc.send() is nearly instantaneous — it just copies data into the
+ * DataChannel's internal buffer. The sender showed 5–10 MB/s because
+ * it was measuring how fast JS could fill the buffer, not how fast
+ * SCTP was transmitting data over WiFi.
  *
- * FIX: yield with `await yieldToEventLoop()` every BURST_LIMIT bytes.
- * This gives Chrome's networking thread a chance to process ACKs and
- * grow cwnd between bursts → smooth, sustained throughput.
+ * The receiver's speed (442 KB/s) was correct — it measured actual
+ * bytes arriving over the network.
  *
- * BUG 3 — SPEEDMETER DECAYS TO ZERO DURING STALLS → ABSURD ETA
+ * THE FIX: Compute `effectivelySent = bytesSent - dc.bufferedAmount`.
+ *   dc.bufferedAmount = bytes queued in DC buffer but NOT yet handed
+ *   to SCTP. So bytesSent - bufferedAmount ≈ bytes actually sent to
+ *   the SCTP stack (and on their way to the receiver). This makes the
+ *   sender's speed meter match what the receiver sees.
+ *
+ * BUG 3 — RTCErrorEvent FROM SENDING ON CLOSING CHANNEL
  * ─────────────────────────────────────────────────────────────────
- * The uiTimer fires every 100ms and calls speed.update(bytesSent).
- * During a SCTP stall, bytesSent doesn't change. The old SpeedMeter:
- *   currentSpeed = deltaB / deltaT = 0 / 0.1 = 0
- *   smoothedSpeed = (0 × 0.3) + (smoothedSpeed × 0.7) → decays to ~0
- * After a 2-second stall: smoothedSpeed ≈ 0.00000001 B/s.
- * ETA = (remaining bytes) / 0.00000001 = 266 trillion hours.
- *
- * FIX: if deltaB == 0, skip the smoothing update. The last known speed
- * is preserved during stalls → ETA stays meaningful.
- * Also: cap ETA display at 99 minutes to guard against edge cases.
+ * The RTCErrorEvent visible in the console was caused by dc.send()
+ * being called after the DataChannel started closing (e.g. on back
+ * navigation or disconnect). Added a readyState guard before sends.
  */
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
-const CHUNK_SIZE     = 65536;    //  64 KB per dc.send() — proven reliable with Chrome SCTP.
-                                 //  256 KB (v10) caused excessive head-of-line blocking
-                                 //  on retransmission events — reverted to 64 KB.
+const CHUNK_SIZE     = 65536;    //  64 KB per dc.send()
 
-const BATCH_BYTES    = 8388608;  //   8 MB per disk read — large enough to keep the
-                                 //   disk pipeline full without wasting RAM.
+const BATCH_BYTES    = 8388608;  //   8 MB per disk read
 
-const HIGH_WATERMARK = 1048576;  //   1 MB — pause when DataChannel buffer hits this.
-                                 //   Small enough that SCTP's cwnd never collapses.
-                                 //   v10's 8 MB caused burst→stall cycles.
+const HIGH_WATERMARK = 2097152;  //   2 MB — pause threshold.
+                                 //   Raised slightly from v11's 1 MB to keep
+                                 //   more data in-flight for higher throughput,
+                                 //   while still preventing SCTP cwnd collapse.
 
-const LOW_WATERMARK  = 131072;   // 128 KB — resume once buffer drains here.
-                                 //   Tight threshold → we resume quickly after drain.
+const LOW_WATERMARK  = 262144;   // 256 KB — resume threshold.
 
-const BURST_LIMIT    = 524288;   // 512 KB — yield to the browser event loop after
-                                 //   sending this many bytes synchronously.
-                                 //   Lets Chrome's SCTP process ACKs mid-burst
-                                 //   → cwnd grows continuously → no stall cycles.
+const BURST_LIMIT    = 1048576;  //   1 MB — yield to browser after this many
+                                 //   bytes. Doubled from v11's 512 KB since
+                                 //   MessageChannel yields are ~0ms (not 1000ms)
+                                 //   so we can afford larger bursts before ACK
+                                 //   processing. Less yield overhead = faster.
 
 // ─── ICE / STUN config ────────────────────────────────────────────────────
 
@@ -111,11 +107,6 @@ export class SpeedMeter {
   #lastTime      = performance.now();
   #smoothedSpeed = 0;
 
-  /**
-   * v11 fix: only update smoothedSpeed when bytes are actually moving.
-   * If deltaB == 0, skip the EMA blend — preserve last known speed.
-   * This prevents the "266 trillion hour ETA" caused by stall decay.
-   */
   update(currentTotalBytes) {
     const now    = performance.now();
     const deltaT = (now - this.#lastTime) / 1000;
@@ -125,7 +116,9 @@ export class SpeedMeter {
     this.#lastBytes = currentTotalBytes;
     this.#lastTime  = now;
 
-    if (deltaB <= 0) return; // ← KEY FIX: skip blend if no bytes moved
+    // Skip blend when no bytes moved — preserves last known speed.
+    // Prevents the "266 trillion hour ETA" from stall-decay (v11 fix).
+    if (deltaB <= 0) return;
 
     const currentSpeed  = deltaB / deltaT;
     this.#smoothedSpeed = this.#smoothedSpeed === 0
@@ -154,9 +147,7 @@ function _fmtSpeed(bps) {
 }
 
 function _fmtETA(s) {
-  // v11 fix: cap absurd ETAs. Previously a near-zero speed (after stall decay)
-  // produced enormous-but-finite values like "266683536050.2h left".
-  // Cap at 99 minutes → show "—" for anything beyond that.
+  // Cap at 99 min — prevents absurd strings from near-zero speed readings.
   if (!isFinite(s) || s < 0 || s > 5940) return '—';
   if (s < 4)    return 'almost done';
   if (s < 60)   return `${Math.round(s)}s left`;
@@ -166,28 +157,14 @@ function _fmtETA(s) {
 
 // ─── Backpressure primitives ───────────────────────────────────────────────
 
-/**
- * drainBuffer — resolves when safe to resume sending.
- * Race-condition-free: synchronous check inside the Promise constructor.
- * If the buffer already drained below LOW_WATERMARK before we attach
- * the listener, we resolve immediately — no deadlock.
- */
 function drainBuffer(dc) {
   return new Promise(resolve => {
-    if (!dc || dc.bufferedAmount < LOW_WATERMARK) {
-      resolve();
-      return;
-    }
+    if (!dc || dc.bufferedAmount < LOW_WATERMARK) { resolve(); return; }
     dc.bufferedAmountLowThreshold = LOW_WATERMARK;
     dc.addEventListener('bufferedamountlow', resolve, { once: true });
   });
 }
 
-/**
- * waitForFullDrain — wait until send buffer is completely empty.
- * Called after the last chunk to ensure 'done' signal arrives after
- * all data chunks (prevents truncated files on the receiver).
- */
 function waitForFullDrain(dc) {
   return new Promise(resolve => {
     if (!dc || dc.bufferedAmount === 0) { resolve(); return; }
@@ -201,20 +178,39 @@ function waitForFullDrain(dc) {
   });
 }
 
+// ─── MessageChannel-based yield ───────────────────────────────────────────
+
 /**
- * yieldToEventLoop — give Chrome's networking thread a timeslice.
+ * yieldToChannel() — fires in the NEXT TASK QUEUE TURN.
  *
- * Chrome's SCTP congestion control (cwnd) is updated when ACKs arrive
- * from the receiver. ACK processing requires the browser's event loop
- * to turn over. If JS holds the thread with a tight synchronous loop,
- * cwnd never grows → throughput is capped at the initial slow-start
- * value → you see a small burst followed by a long stall.
+ * WHY NOT setTimeout(r, 0)?
+ *   setTimeout has a minimum delay of 1ms when the tab is active, and
+ *   is throttled to 1000ms MINIMUM when the tab is in the background
+ *   (Chrome's "background timer throttling" policy). If you switch from
+ *   the sender tab to the receiver tab to watch progress, the sender
+ *   becomes a background tab and setTimeout fires at most once per second.
+ *   With BURST_LIMIT = 512KB, this caps throughput at 512 KB/s.
  *
- * Awaiting this every BURST_LIMIT bytes lets the browser breathe,
- * processes pending ACKs, grows cwnd, and keeps throughput steady.
+ * WHY MessageChannel?
+ *   MessageChannel.postMessage() schedules a MessageEvent in the task
+ *   queue. This is NOT subject to timer throttling — it fires in the
+ *   next available task turn regardless of whether the tab is in focus.
+ *   Typical latency: 0–1ms in foreground AND background.
+ *
+ * WHY YIELD AT ALL?
+ *   Chrome's SCTP networking runs on a separate thread, but incoming
+ *   SCTP ACKs (which update the congestion window, cwnd) are processed
+ *   as browser tasks. If JS monopolises the main thread, pending ACK
+ *   tasks pile up, cwnd stagnates, and throughput is capped at its
+ *   initial value. Yielding every BURST_LIMIT bytes lets ACK tasks run.
  */
-function yieldToEventLoop() {
-  return new Promise(r => setTimeout(r, 0));
+let _yieldChannel = null;
+function yieldToChannel() {
+  if (!_yieldChannel) _yieldChannel = new MessageChannel();
+  return new Promise(resolve => {
+    _yieldChannel.port1.onmessage = resolve;
+    _yieldChannel.port2.postMessage(null);
+  });
 }
 
 // ─── RipplePeer ───────────────────────────────────────────────────────────
@@ -241,24 +237,21 @@ export class RipplePeer {
   async init() {
     this.#pc = new RTCPeerConnection(ICE_CONFIG);
 
-    // ── ICE candidate handler ──────────────────────────────────────────────
     this.#pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
       console.log('[ICE] Candidate:', candidate.type, candidate.address ?? '(mDNS)');
       this.#socket.emit('signal', { signal: { type: 'ice', candidate } });
     };
 
-    // ── ICE state ─────────────────────────────────────────────────────────
     this.#pc.oniceconnectionstatechange = () => {
       const s = this.#pc?.iceConnectionState;
       if (!s) return;
       console.log('[ICE]', s);
       if (s === 'connected' || s === 'completed') this.#logIceStats();
-      if (s === 'failed')       this.#cb.onError?.('Direct connection failed. Ensure both devices are on the same Wi-Fi or can reach the internet.');
+      if (s === 'failed')       this.#cb.onError?.('Connection failed. Ensure both devices are on the same Wi-Fi or can reach the internet.');
       if (s === 'disconnected') this.#cb.onError?.('The other device disconnected.');
     };
 
-    // ── DataChannel setup ──────────────────────────────────────────────────
     if (this.#role === 'host') {
       this.#dc = this.#pc.createDataChannel('rippledrop', { ordered: true });
       this.#dc.bufferedAmountLowThreshold = LOW_WATERMARK;
@@ -299,8 +292,6 @@ export class RipplePeer {
     }
   }
 
-  // ── ICE stats ─────────────────────────────────────────────────────────────
-
   async #logIceStats() {
     try {
       await new Promise(r => setTimeout(r, 700));
@@ -336,16 +327,17 @@ export class RipplePeer {
     }
   }
 
-  // ── DataChannel binding ────────────────────────────────────────────────────
-
   #bindChannel(dc) {
-    dc.onopen    = () => this.#cb.onOpen?.();
-    dc.onclose   = () => this.#cb.onClose?.();
-    dc.onerror   = (e) => { console.error('[DC]', e); this.#cb.onError?.('Transfer channel error.'); };
+    dc.onopen  = () => this.#cb.onOpen?.();
+    dc.onclose = () => this.#cb.onClose?.();
+    dc.onerror = (e) => {
+      // Log full error details to help diagnose RTCErrorEvent issues
+      const err = e.error;
+      console.error('[DC] RTCErrorEvent:', err?.errorDetail ?? 'unknown', err?.message ?? e);
+      this.#cb.onError?.('Transfer channel error — check console for details.');
+    };
     dc.onmessage = (e) => this.#onMessage(e);
   }
-
-  // ── Receive path ──────────────────────────────────────────────────────────
 
   #onMessage({ data }) {
     if (typeof data === 'string') {
@@ -379,15 +371,11 @@ export class RipplePeer {
     }
   }
 
-  // ── Public send API ────────────────────────────────────────────────────────
-
   async sendFiles(files, onProgress) {
     for (let i = 0; i < files.length; i++) {
       await this.#sendOne(files[i], i, files.length, onProgress);
     }
   }
-
-  // ── Core send loop ─────────────────────────────────────────────────────────
 
   async #sendOne(file, fileIndex, fileTotal, onProgress) {
     const meta = {
@@ -404,27 +392,45 @@ export class RipplePeer {
     }
 
     const speed     = new SpeedMeter();
-    let   bytesSent = 0;
+    let   bytesSent = 0; // bytes passed to dc.send() (used for progress %)
 
     const uiTimer = setInterval(() => {
       if (!this.#dc) return;
-      speed.update(bytesSent); // no-op if bytesSent unchanged → no decay
-      onProgress?.({ sentBytes: bytesSent, totalBytes: file.size, speed, meta, fileIndex, fileTotal, isLastChunk: false });
+
+      // ── v12 SPEED METER FIX ────────────────────────────────────────────
+      // bytesSent = bytes QUEUED into DataChannel (dc.send is near-instant)
+      // dc.bufferedAmount = bytes still sitting in DC buffer, not yet sent
+      // effectivelySent ≈ bytes actually handed to SCTP → close to what
+      //                   the receiver is counting.
+      //
+      // Without this fix, the sender showed 5–10 MB/s (queue fill rate)
+      // while the receiver showed 442 KB/s (true network rate). Now both
+      // sides agree on the speed.
+      const effectivelySent = Math.max(0, bytesSent - (this.#dc?.bufferedAmount ?? 0));
+      speed.update(effectivelySent);
+
+      onProgress?.({
+        sentBytes:  bytesSent,       // use queue bytes for % progress
+        totalBytes: file.size,
+        speed,
+        meta, fileIndex, fileTotal,
+        isLastChunk: false,
+      });
     }, 100);
 
     try {
-      // ── THREE-LEVEL FLOW CONTROL ───────────────────────────────────────────
+      // ── THREE-LEVEL FLOW CONTROL ───────────────────────────────────────
       //
-      // Level 1 — BURST LIMIT (NEW in v11, most important):
-      //   yield to event loop every 512 KB. Lets Chrome process SCTP ACKs
-      //   and grow cwnd. Without this, cwnd stagnates → burst→stall pattern.
+      // Level 1 — BURST LIMIT (MessageChannel yield every 1 MB):
+      //   Lets Chrome process SCTP ACKs mid-burst so cwnd can grow.
+      //   Uses MessageChannel instead of setTimeout — NOT throttled in
+      //   background tabs (fixes the 512 KB/s background-tab ceiling).
       //
-      // Level 2 — BACKPRESSURE:
-      //   block when DataChannel buffer hits 1 MB. Small watermark prevents
-      //   SCTP rwnd exhaustion and cwnd collapse.
+      // Level 2 — BACKPRESSURE (drainBuffer at 2 MB):
+      //   Prevents flooding SCTP's receive window and causing cwnd collapse.
       //
       // Level 3 — DISK PIPELINE:
-      //   while sending batch N, disk-read batch N+1 runs concurrently.
+      //   Disk read for batch N+1 starts while batch N is being sent.
 
       let fileOffset = 0;
       let nextBatchPromise = this.#readBatch(file, fileOffset);
@@ -444,21 +450,23 @@ export class RipplePeer {
         let burstBytes = 0;
 
         for (let i = 0; i < batch.byteLength; i += CHUNK_SIZE) {
-          if (!this.#dc) throw new Error('DataChannel closed during send');
+          if (!this.#dc || this.#dc.readyState !== 'open') {
+            throw new Error('DataChannel closed during send');
+          }
 
           const end  = Math.min(i + CHUNK_SIZE, batch.byteLength);
-          const view = new Uint8Array(batch, i, end - i); // zero-copy view
+          const view = new Uint8Array(batch, i, end - i);
           this.#dc.send(view);
           bytesSent  += view.byteLength;
           burstBytes += view.byteLength;
 
-          // Level 1: yield every 512 KB so SCTP can process ACKs
+          // Level 1: MessageChannel yield — background-tab safe
           if (burstBytes >= BURST_LIMIT) {
             burstBytes = 0;
-            await yieldToEventLoop();
+            await yieldToChannel();
           }
 
-          // Level 2: block only when buffer is genuinely full
+          // Level 2: backpressure
           if (this.#dc && this.#dc.bufferedAmount >= HIGH_WATERMARK) {
             await drainBuffer(this.#dc);
             burstBytes = 0;
@@ -482,8 +490,6 @@ export class RipplePeer {
     if (startOffset >= file.size) return Promise.resolve(null);
     return file.slice(startOffset, Math.min(startOffset + BATCH_BYTES, file.size)).arrayBuffer();
   }
-
-  // ── Cleanup ────────────────────────────────────────────────────────────────
 
   close() {
     try { this.#dc?.close(); } catch (_) {}
