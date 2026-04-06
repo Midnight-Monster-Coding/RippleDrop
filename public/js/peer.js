@@ -1,36 +1,71 @@
 /**
- * RippleDrop — WebRTC Peer Manager  v13
+ * RippleDrop — WebRTC Peer Manager  v14
  *
  * ══════════════════════════════════════════════════════════════════
- * BUG FIXED IN v13
+ * BUGS FIXED IN v14
  * ══════════════════════════════════════════════════════════════════
  *
- * BUG — ORDERED DATACHANNEL CAUSES HEAD-OF-LINE BLOCKING (~1 MB/s CAP)
+ * BUG 1 — SCTP cwnd NEVER GROWS → PERMANENT ~16 KB WINDOW (~700 KB/s)
  * ─────────────────────────────────────────────────────────────────
- * v12 used `ordered: true` on the DataChannel and reconstructed the
- * file by simply doing `this.#incomingChunks.push(data)`. SCTP's
- * ordered-reliable mode means a single retransmitted chunk blocks
- * ALL subsequent chunks from being delivered to JS, even if they
- * have already arrived at the receiver's SCTP stack. This head-of-
- * line (HOL) blocking caps real-world throughput at ~1 MB/s on LAN
- * even though the ICE path is a direct host-to-host connection.
+ * Diagnosis: at 713 KB/s and 23 ms RTT the bytes-in-flight formula
+ * gives: 713 KB/s × 0.023 s = ~16 KB. That is SCTP's congestion
+ * window — barely one 64 KB chunk. cwnd should grow exponentially
+ * via slow-start, but it never got the chance.
  *
- * THE FIX: Switch to `ordered: false` + sequence-number reassembly.
+ * Why cwnd stagnated: the v12/v13 sawtooth fill-drain cycle used
+ * HIGH_WATERMARK = 2 MB and LOW_WATERMARK = 256 KB.
  *
- *   SENDER: Each binary packet now carries an 8-byte header:
- *     [seq: uint32LE][len: uint32LE][payload...]
- *   The meta message includes `totalChunks` so the receiver knows
- *   exactly how many packets to expect.
+ *   fill to 2 MB  → near-instant (dc.send is just a memcpy)
+ *   drain to 256 KB at 713 KB/s → takes 2.45 s
+ *   repeat
  *
- *   RECEIVER: Chunks are stored in a Map keyed by seq number instead
- *   of pushed onto an array. On 'done', the map is iterated in order
- *   (seq 0 … totalChunks-1) to build the Blob. Any gap triggers an
- *   error instead of silently corrupting the file.
+ * During those 2.45 s the JS sender is IDLE (waiting for the
+ * bufferedamountlow event). The SCTP layer IS still transmitting
+ * queued data, but many SCTP implementations only expand cwnd when
+ * new data is being actively acknowledged against fresh sends. Once
+ * JS stops calling dc.send(), cwnd growth stalls at its initial
+ * value and the 2.45 s drain window resets it before it can climb.
  *
- *   With `ordered: false`, a retransmitted chunk no longer blocks
- *   later chunks — the receiver keeps accepting data while the
- *   missing chunk is re-sent in the background. Expected throughput
- *   on a direct LAN path: 20–80 MB/s.
+ * THE FIX: Much larger HIGH/LOW watermarks.
+ *   HIGH_WATERMARK = 16 MB → we don't pause until 16 MB is queued.
+ *   LOW_WATERMARK  =  4 MB → we resume at 4 MB, not 256 KB.
+ *
+ * With the new settings the drain cycle covers 12 MB at (hopefully
+ * growing) network speed. That gives cwnd ~520 ms of continuous
+ * transmit time at 23 ms RTT — roughly 22 slow-start doublings —
+ * before JS needs to refill. cwnd can reach the full LAN pipe in
+ * that window.
+ *
+ * BURST_LIMIT is also raised to 4 MB so yields are 4× less frequent,
+ * reducing main-thread interruptions.
+ *
+ * BUG 2 — `done` ARRIVES BEFORE LAST BINARY CHUNKS (UNORDERED BUG)
+ * ─────────────────────────────────────────────────────────────────
+ * v13 switched to ordered:false. The sender calls waitForFullDrain()
+ * (bufferedAmount → 0) before sending `done`. But bufferedAmount = 0
+ * only means data left the DataChannel buffer — it is now in the
+ * SCTP send queue. With unordered delivery, the `done` JSON frame
+ * can be handed to the receiver's JS BEFORE the last binary chunks
+ * finish their SCTP retransmit cycle.
+ *
+ * When this happened the v13 receiver immediately tried to assemble
+ * the Blob, found gaps, and fired the "Missing chunk N" error even
+ * though those chunks were still in flight and would have arrived.
+ *
+ * THE FIX: `#doneReceived` flag + `#tryAssemble()` helper.
+ *   When `done` arrives, attempt assembly immediately. If any chunk
+ *   is missing, set the flag and return. Each subsequent binary
+ *   chunk checks the flag and calls `#tryAssemble()` again. As soon
+ *   as the Map is complete the Blob is built — no error, no timeout.
+ *
+ * BUGS FIXED IN v13
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * BUG — ORDERED DATACHANNEL CAUSES HEAD-OF-LINE BLOCKING
+ * ─────────────────────────────────────────────────────────────────
+ * v12 used `ordered: true`. A single retransmitted chunk blocked all
+ * later chunks from being delivered to JS. Switching to ordered:false
+ * + seq-number Map reassembly removes that HOL bottleneck.
  *
  * ══════════════════════════════════════════════════════════════════
  * BUGS FIXED IN v12
@@ -86,20 +121,22 @@
 
 const CHUNK_SIZE     = 65536;    //  64 KB per dc.send()
 
-const BATCH_BYTES    = 8388608;  //   8 MB per disk read
+const BATCH_BYTES    = 33554432; //  32 MB per disk read (doubled; fewer File.slice calls)
 
-const HIGH_WATERMARK = 2097152;  //   2 MB — pause threshold.
-                                 //   Raised slightly from v11's 1 MB to keep
-                                 //   more data in-flight for higher throughput,
-                                 //   while still preventing SCTP cwnd collapse.
+const HIGH_WATERMARK = 16777216; //  16 MB — pause threshold.
+                                 //  v14: raised from 2 MB. More data queued in SCTP
+                                 //  at all times → cwnd has a full drain window (~520 ms
+                                 //  at 23 ms RTT = ~22 slow-start doublings) to climb
+                                 //  before JS needs to call dc.send() again.
 
-const LOW_WATERMARK  = 262144;   // 256 KB — resume threshold.
+const LOW_WATERMARK  = 4194304;  //   4 MB — resume threshold.
+                                 //  v14: raised from 256 KB. Resuming at 4 MB keeps
+                                 //  the SCTP queue from going dry between refills.
 
-const BURST_LIMIT    = 1048576;  //   1 MB — yield to browser after this many
-                                 //   bytes. Doubled from v11's 512 KB since
-                                 //   MessageChannel yields are ~0ms (not 1000ms)
-                                 //   so we can afford larger bursts before ACK
-                                 //   processing. Less yield overhead = faster.
+const BURST_LIMIT    = 4194304;  //   4 MB — yield to browser after this many bytes.
+                                 //  v14: raised from 1 MB. Fewer yields = less
+                                 //  main-thread interruption, without meaningfully
+                                 //  delaying ACK processing on a 23 ms RTT path.
 
 // ─── ICE / STUN config ────────────────────────────────────────────────────
 
@@ -258,6 +295,7 @@ export class RipplePeer {
   #incomingChunks  = new Map();
   #receivedBytes   = 0;
   #expectedChunks  = 0;
+  #doneReceived    = false;   // v14: true when 'done' arrived before all chunks
   #recvSpeed       = new SpeedMeter();
 
   constructor({ role, socket, callbacks }) {
@@ -371,6 +409,23 @@ export class RipplePeer {
     dc.onmessage = (e) => this.#onMessage(e);
   }
 
+  // ── v14: extracted so both 'done' handler and chunk handler can call it ──
+  #tryAssemble() {
+    for (let i = 0; i < this.#expectedChunks; i++) {
+      if (!this.#incomingChunks.has(i)) return; // still waiting for chunk i
+    }
+    // All chunks present — build Blob in sequence order.
+    const chunks = [];
+    for (let i = 0; i < this.#expectedChunks; i++) chunks.push(this.#incomingChunks.get(i));
+    const blob = new Blob(chunks, { type: this.#incomingMeta.mimeType });
+    this.#cb.onFileDone?.(blob, this.#incomingMeta);
+    this.#incomingMeta    = null;
+    this.#incomingChunks  = new Map();
+    this.#receivedBytes   = 0;
+    this.#expectedChunks  = 0;
+    this.#doneReceived    = false;
+  }
+
   #onMessage({ data }) {
     if (typeof data === 'string') {
       const msg = JSON.parse(data);
@@ -380,27 +435,19 @@ export class RipplePeer {
         this.#incomingChunks  = new Map();
         this.#receivedBytes   = 0;
         this.#expectedChunks  = msg.totalChunks || 0;
+        this.#doneReceived    = false;
         this.#recvSpeed       = new SpeedMeter();
         this.#cb.onFileMeta?.(msg);
 
       } else if (msg.type === 'done') {
-        // Reassemble in sequence order — safe even with unordered delivery.
-        const chunks = [];
-        for (let i = 0; i < this.#expectedChunks; i++) {
-          const chunk = this.#incomingChunks.get(i);
-          if (!chunk) {
-            this.#cb.onError?.(`Missing chunk ${i + 1}/${this.#expectedChunks} — transfer incomplete.`);
-            return;
-          }
-          chunks.push(chunk);
-        }
-        const blob = new Blob(chunks, { type: this.#incomingMeta.mimeType });
-        this.#cb.onFileDone?.(blob, this.#incomingMeta);
-        this.#incomingMeta    = null;
-        this.#incomingChunks  = new Map();
-        this.#receivedBytes   = 0;
-        this.#expectedChunks  = 0;
+        // v14 FIX: with ordered:false, 'done' can arrive before the last
+        // binary chunks (which may still be in SCTP retransmit). Attempt
+        // assembly now; if chunks are missing, set the flag and let each
+        // incoming chunk retry via #tryAssemble() below.
+        this.#doneReceived = true;
+        this.#tryAssemble();
       }
+
       return;
     }
 
@@ -422,6 +469,10 @@ export class RipplePeer {
       speed:         this.#recvSpeed,
       meta:          this.#incomingMeta,
     });
+
+    // v14: if 'done' already arrived and this was the last missing chunk,
+    // assemble now (covers the late-chunk race on unordered channels).
+    if (this.#doneReceived) this.#tryAssemble();
   }
 
   async sendFiles(files, onProgress) {
