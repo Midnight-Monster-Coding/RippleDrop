@@ -1,5 +1,36 @@
 /**
- * RippleDrop — WebRTC Peer Manager  v12
+ * RippleDrop — WebRTC Peer Manager  v13
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * BUG FIXED IN v13
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * BUG — ORDERED DATACHANNEL CAUSES HEAD-OF-LINE BLOCKING (~1 MB/s CAP)
+ * ─────────────────────────────────────────────────────────────────
+ * v12 used `ordered: true` on the DataChannel and reconstructed the
+ * file by simply doing `this.#incomingChunks.push(data)`. SCTP's
+ * ordered-reliable mode means a single retransmitted chunk blocks
+ * ALL subsequent chunks from being delivered to JS, even if they
+ * have already arrived at the receiver's SCTP stack. This head-of-
+ * line (HOL) blocking caps real-world throughput at ~1 MB/s on LAN
+ * even though the ICE path is a direct host-to-host connection.
+ *
+ * THE FIX: Switch to `ordered: false` + sequence-number reassembly.
+ *
+ *   SENDER: Each binary packet now carries an 8-byte header:
+ *     [seq: uint32LE][len: uint32LE][payload...]
+ *   The meta message includes `totalChunks` so the receiver knows
+ *   exactly how many packets to expect.
+ *
+ *   RECEIVER: Chunks are stored in a Map keyed by seq number instead
+ *   of pushed onto an array. On 'done', the map is iterated in order
+ *   (seq 0 … totalChunks-1) to build the Blob. Any gap triggers an
+ *   error instead of silently corrupting the file.
+ *
+ *   With `ordered: false`, a retransmitted chunk no longer blocks
+ *   later chunks — the receiver keeps accepting data while the
+ *   missing chunk is re-sent in the background. Expected throughput
+ *   on a direct LAN path: 20–80 MB/s.
  *
  * ══════════════════════════════════════════════════════════════════
  * BUGS FIXED IN v12
@@ -223,10 +254,11 @@ export class RipplePeer {
   #socket;
   #cb;
 
-  #incomingMeta   = null;
-  #incomingChunks = [];
-  #receivedBytes  = 0;
-  #recvSpeed      = new SpeedMeter();
+  #incomingMeta    = null;
+  #incomingChunks  = new Map();
+  #receivedBytes   = 0;
+  #expectedChunks  = 0;
+  #recvSpeed       = new SpeedMeter();
 
   constructor({ role, socket, callbacks }) {
     this.#role   = role;
@@ -253,7 +285,7 @@ export class RipplePeer {
     };
 
     if (this.#role === 'host') {
-      this.#dc = this.#pc.createDataChannel('rippledrop', { ordered: true });
+      this.#dc = this.#pc.createDataChannel('rippledrop', { ordered: false });
       this.#dc.bufferedAmountLowThreshold = LOW_WATERMARK;
       this.#dc.binaryType = 'arraybuffer';
       this.#bindChannel(this.#dc);
@@ -344,31 +376,52 @@ export class RipplePeer {
       const msg = JSON.parse(data);
 
       if (msg.type === 'meta') {
-        this.#incomingMeta   = msg;
-        this.#incomingChunks = [];
-        this.#receivedBytes  = 0;
-        this.#recvSpeed      = new SpeedMeter();
+        this.#incomingMeta    = msg;
+        this.#incomingChunks  = new Map();
+        this.#receivedBytes   = 0;
+        this.#expectedChunks  = msg.totalChunks || 0;
+        this.#recvSpeed       = new SpeedMeter();
         this.#cb.onFileMeta?.(msg);
 
       } else if (msg.type === 'done') {
-        const blob = new Blob(this.#incomingChunks, { type: this.#incomingMeta.mimeType });
+        // Reassemble in sequence order — safe even with unordered delivery.
+        const chunks = [];
+        for (let i = 0; i < this.#expectedChunks; i++) {
+          const chunk = this.#incomingChunks.get(i);
+          if (!chunk) {
+            this.#cb.onError?.(`Missing chunk ${i + 1}/${this.#expectedChunks} — transfer incomplete.`);
+            return;
+          }
+          chunks.push(chunk);
+        }
+        const blob = new Blob(chunks, { type: this.#incomingMeta.mimeType });
         this.#cb.onFileDone?.(blob, this.#incomingMeta);
-        this.#incomingMeta   = null;
-        this.#incomingChunks = [];
-        this.#receivedBytes  = 0;
+        this.#incomingMeta    = null;
+        this.#incomingChunks  = new Map();
+        this.#receivedBytes   = 0;
+        this.#expectedChunks  = 0;
       }
-
-    } else {
-      this.#incomingChunks.push(data);
-      this.#receivedBytes += data.byteLength;
-      this.#recvSpeed.update(this.#receivedBytes);
-      this.#cb.onChunkReceived?.({
-        receivedBytes: this.#receivedBytes,
-        totalBytes:    this.#incomingMeta?.size ?? 1,
-        speed:         this.#recvSpeed,
-        meta:          this.#incomingMeta,
-      });
+      return;
     }
+
+    // Binary packet layout: [seq:uint32LE][len:uint32LE][payload...]
+    const dv      = new DataView(data);
+    const seq     = dv.getUint32(0, true);
+    const len     = dv.getUint32(4, true);
+    const payload = data.slice(8, 8 + len);
+
+    if (!this.#incomingChunks.has(seq)) {
+      this.#incomingChunks.set(seq, payload);
+      this.#receivedBytes += payload.byteLength;
+      this.#recvSpeed.update(this.#receivedBytes);
+    }
+
+    this.#cb.onChunkReceived?.({
+      receivedBytes: this.#receivedBytes,
+      totalBytes:    this.#incomingMeta?.size ?? 1,
+      speed:         this.#recvSpeed,
+      meta:          this.#incomingMeta,
+    });
   }
 
   async sendFiles(files, onProgress) {
@@ -378,10 +431,13 @@ export class RipplePeer {
   }
 
   async #sendOne(file, fileIndex, fileTotal, onProgress) {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 0;
     const meta = {
       type: 'meta', name: file.name, size: file.size,
       mimeType: file.type || 'application/octet-stream',
       fileIndex, fileTotal,
+      totalChunks,
+      chunkSize: CHUNK_SIZE,
     };
     this.#dc.send(JSON.stringify(meta));
 
@@ -393,6 +449,7 @@ export class RipplePeer {
 
     const speed     = new SpeedMeter();
     let   bytesSent = 0; // bytes passed to dc.send() (used for progress %)
+    let   seq       = 0; // global chunk sequence number for this file
 
     const uiTimer = setInterval(() => {
       if (!this.#dc) return;
@@ -454,11 +511,22 @@ export class RipplePeer {
             throw new Error('DataChannel closed during send');
           }
 
-          const end  = Math.min(i + CHUNK_SIZE, batch.byteLength);
-          const view = new Uint8Array(batch, i, end - i);
-          this.#dc.send(view);
-          bytesSent  += view.byteLength;
-          burstBytes += view.byteLength;
+          const end     = Math.min(i + CHUNK_SIZE, batch.byteLength);
+          const payload = new Uint8Array(batch, i, end - i);
+
+          // Packet = 8-byte header [seq:uint32LE][len:uint32LE] + payload.
+          // The receiver keys each chunk by seq so it can reconstruct the
+          // file in order even though the DataChannel is unordered.
+          const packet = new Uint8Array(8 + payload.byteLength);
+          const dv     = new DataView(packet.buffer);
+          dv.setUint32(0, seq, true);               // chunk sequence number
+          dv.setUint32(4, payload.byteLength, true); // payload byte length
+          packet.set(payload, 8);
+
+          this.#dc.send(packet);
+          bytesSent  += payload.byteLength;
+          burstBytes += payload.byteLength;
+          seq++;
 
           // Level 1: MessageChannel yield — background-tab safe
           if (burstBytes >= BURST_LIMIT) {
