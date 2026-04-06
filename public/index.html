@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RippleDrop — Drop files. Instantly.</title>
+  <meta name="description" content="AirDrop for every device. P2P file transfer across any platform." />
+  <meta name="theme-color" content="#0c1018" />
+
+  <!-- Fonts & Styles -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="/css/app.css" />
+
+  <!-- QR library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <!-- GSAP for particle physics animations -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+
+  <!-- Socket.io -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- App entry -->
+  <script type="module" src="/js/app.js"></script>
+</head>
+
+<body>
+
+  <!-- ════════════ WAVE LAYER (fixed, z-20) ════════════ -->
+  <!-- Hidden until transfer begins. Contains canvas + floating file particles. -->
+  <div id="wave-layer">
+    <canvas id="wave-canvas"></canvas>
+    <div id="particles-container"></div>
+  </div>
+
+  <!-- ════════════ BOTTOM TRANSFER HUD (fixed, z-35) ════════════ -->
+  <div id="transfer-hud">
+    <div class="hud-sect">
+      <span class="hud-lbl">Speed</span>
+      <span class="hud-val" id="hud-speed">—</span>
+    </div>
+
+    <div class="hud-sep"></div>
+
+    <!-- SVG ring progress -->
+    <div class="hud-ring-wrap">
+      <svg class="hud-ring" viewBox="0 0 52 52" xmlns="http://www.w3.org/2000/svg">
+        <circle class="ring-track" cx="26" cy="26" r="22"/>
+        <circle class="ring-fill"  cx="26" cy="26" r="22" id="hud-ring-fill"/>
+      </svg>
+      <span class="hud-pct" id="hud-pct">0%</span>
+    </div>
+
+    <div class="hud-sep"></div>
+
+    <div class="hud-sect">
+      <span class="hud-lbl">ETA</span>
+      <span class="hud-val" id="hud-eta">—</span>
+    </div>
+  </div>
+
+  <!-- ════════════ APP VIEWS ════════════ -->
+  <div id="app">
+
+    <!-- ═══════════════════ HOME ═══════════════════ -->
+    <div id="view-home" class="view active">
+
+      <div class="logo-wrap">
+        <div class="logo-icon">
+          <div class="ripple-ring"></div>
+          <div class="ripple-ring"></div>
+          <div class="ripple-ring"></div>
+          <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="RippleDrop logo">
+            <path d="M20 4C20 4 8 13 8 22C8 28.627 13.373 34 20 34C26.627 34 32 28.627 32 22C32 13 20 4 20 4Z"
+                  fill="rgba(34,211,238,0.14)" stroke="#22d3ee" stroke-width="1.5"/>
+            <path d="M20 12C20 12 14 17 14 22C14 25.314 16.686 28 20 28C23.314 28 26 25.314 26 22C26 17 20 12 20 12Z"
+                  fill="rgba(34,211,238,0.24)" stroke="#22d3ee" stroke-width="1.5"/>
+            <circle cx="20" cy="22" r="4" fill="#22d3ee"/>
+          </svg>
+        </div>
+        <div class="logo-name">RippleDrop</div>
+      </div>
+
+      <p class="tagline">
+        AirDrop for every device and every browser.<br>
+        No apps. No accounts. Direct P2P speed.
+      </p>
+
+      <div class="home-actions">
+        <button class="btn-main" id="btn-send">
+          <span class="btn-icon">📤</span>
+          <span>Send Files</span>
+        </button>
+        <button class="btn-main" id="btn-receive">
+          <span class="btn-icon">📥</span>
+          <span>Receive Files</span>
+        </button>
+      </div>
+
+      <div class="features">
+        <span class="pill">🔒 End-to-end encrypted</span>
+        <span class="pill">⚡ Direct P2P</span>
+        <span class="pill">🌐 Any device</span>
+        <span class="pill">📦 Any file type</span>
+      </div>
+
+    </div>
+
+    <!-- ═══════════════════ SEND ═══════════════════ -->
+    <div id="view-send" class="view">
+
+      <button class="back-btn" id="back-from-send">← Back</button>
+
+      <!-- QR + code (always visible on send view) -->
+      <div class="card qr-card" id="send-waiting-card">
+        <span class="qr-section-title">Scan or enter the code</span>
+
+        <div class="qr-wrap">
+          <div id="qr-container"></div>
+        </div>
+
+        <div class="code-block">
+          <span class="code-label">Room Code</span>
+          <div class="code-value" id="code-display">····</div>
+        </div>
+
+        <div class="code-actions">
+          <button class="btn-sm" id="btn-copy-code">Copy Code</button>
+          <button class="btn-sm" id="btn-copy-link">Copy Link</button>
+        </div>
+
+        <div class="status-line">
+          <div class="status-dot waiting" id="send-status-dot"></div>
+          <span id="send-status-text">Waiting for receiver…</span>
+        </div>
+      </div>
+
+      <!-- Drop zone + progress (shown after peer connects) -->
+      <div id="send-connected-section"
+           class="hidden"
+           style="width:100%;display:flex;flex-direction:column;align-items:center;gap:16px;">
+
+        <div class="connected-badge">Peer Connected</div>
+
+        <div class="card" style="padding:20px;display:flex;flex-direction:column;gap:18px;">
+          <!-- Drop zone -->
+          <div class="drop-zone" id="drop-zone">
+            <div class="drop-icon">🌊</div>
+            <div class="drop-text-main">Drop your files here</div>
+            <div class="drop-text-sub">Photos, videos, documents — anything</div>
+            <button class="btn-choose" id="btn-choose-files">Browse Files</button>
+            <input type="file" id="file-input" multiple hidden />
+          </div>
+
+          <!-- Transfer progress -->
+          <div id="send-progress" class="hidden progress-wrap">
+            <div class="progress-header">
+              <span class="progress-filename"  id="send-prog-name">—</span>
+              <span class="progress-file-count" id="send-prog-count">—</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill send-fill" id="send-prog-fill" style="width:0%"></div>
+            </div>
+            <div class="progress-footer">
+              <span class="progress-speed" id="send-prog-speed">—</span>
+              <span class="progress-pct"   id="send-prog-pct">0%</span>
+              <span class="progress-eta"   id="send-prog-eta">—</span>
+            </div>
+          </div>
+
+          <!-- All done -->
+          <div id="send-complete" class="hidden complete-msg">
+            <div class="complete-icon">🎉</div>
+            <div class="complete-title">All files sent!</div>
+            <div class="complete-sub">Drop more files to keep sending</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ═══════════════════ RECEIVE ════════════════ -->
+    <div id="view-receive" class="view">
+
+      <button class="back-btn" id="back-from-receive">← Back</button>
+
+      <!-- Step 1: Enter code -->
+      <div id="receive-enter-section"
+           class="card"
+           style="display:flex;flex-direction:column;gap:24px;">
+
+        <div class="receive-header">
+          <div class="receive-title">Enter Room Code</div>
+          <div class="receive-sub">Ask the sender for their 4-character code</div>
+        </div>
+
+        <div class="code-inputs">
+          <input class="code-char-input" maxlength="1" id="ci0" autocomplete="off" autocorrect="off" spellcheck="false" />
+          <input class="code-char-input" maxlength="1" id="ci1" autocomplete="off" autocorrect="off" spellcheck="false" />
+          <input class="code-char-input" maxlength="1" id="ci2" autocomplete="off" autocorrect="off" spellcheck="false" />
+          <input class="code-char-input" maxlength="1" id="ci3" autocomplete="off" autocorrect="off" spellcheck="false" />
+        </div>
+
+        <button class="btn-join" id="btn-join" disabled>Join Room</button>
+
+      </div>
+
+      <!-- Step 2: Connecting spinner -->
+      <div id="receive-connecting" class="hidden card">
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
+          <div class="spinner-label">Connecting to peer…</div>
+        </div>
+      </div>
+
+      <!-- Step 3: Connected -->
+      <div id="receive-connected-section"
+           class="hidden"
+           style="width:100%;display:flex;flex-direction:column;align-items:center;gap:16px;">
+
+        <div class="connected-badge">Peer Connected</div>
+
+        <div class="card" style="display:flex;flex-direction:column;gap:20px;">
+
+          <div class="receive-ready-wrap" id="receive-idle">
+            <div class="radar-icon">📡</div>
+            <div class="receive-ready-label">Waiting for the sender to drop files…</div>
+          </div>
+
+          <div id="receive-progress" class="hidden progress-wrap">
+            <div class="progress-header">
+              <span class="progress-filename"  id="recv-prog-name">—</span>
+              <span class="progress-file-size" id="recv-prog-size">—</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill recv-fill" id="recv-prog-fill" style="width:0%"></div>
+            </div>
+            <div class="progress-footer">
+              <span class="progress-speed" id="recv-prog-speed">—</span>
+              <span class="progress-pct"   id="recv-prog-pct">0%</span>
+              <span class="progress-eta"   id="recv-prog-eta">—</span>
+            </div>
+          </div>
+
+          <div id="received-list" class="received-list"></div>
+        </div>
+      </div>
+
+    </div>
+
+  </div><!-- #app -->
+
+  <!-- Toast -->
+  <div id="toast" data-type="error"></div>
+
+</body>
+</html>

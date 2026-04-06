@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log*
+.npm
+
+# Never bundle env files into Docker images
+.env
+.env.*
+process.env
+public/process.env
+public/process
+
+# Dev tooling
+.git
+.gitignore
+*.md
+.DS_Store
+Thumbs.db
