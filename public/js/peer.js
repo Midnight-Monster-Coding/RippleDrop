@@ -1,50 +1,50 @@
 /**
- * RippleDrop — WebRTC Peer Manager  v16
+ * RippleDrop — WebRTC Peer Manager  v17
  *
  * ══════════════════════════════════════════════════════════════════
- * WHY v15 WAS STILL SLOW (1–1.5 MB/s) AND WHAT v16 FIXES
+ * WHAT v17 FIXES OVER v16
  * ══════════════════════════════════════════════════════════════════
  *
- * ROOT CAUSE OF v15's FAILURE:
- *   RFC 4960 (SCTP) defines ONE congestion window (cwnd) per
- *   SCTP *association* — not per stream. A single RTCPeerConnection
- *   creates exactly one SCTP association. Therefore, ALL 6 DataChannels
- *   on one PeerConnection share a single cwnd, making multi-channel
- *   round-robin identical in throughput to a single channel.
- *   The v15 premise ("each channel has its own cwnd") was incorrect.
+ * ROOT CAUSE OF v16's CONNECTION FAILURE:
+ *   A race condition between ICE candidate signals and SDP negotiation.
  *
- * THE REAL FIX — NUM_CONNECTIONS independent RTCPeerConnections:
- *   Each RTCPeerConnection is a separate SCTP association.
- *   Each association has its own, independent cwnd.
- *   All six cwnd values grow simultaneously and independently.
- *   File chunks are sent round-robin across #dcs[0..5],
- *   but now each dc lives on its own PC with its own cwnd.
- *   Combined throughput on a typical 5 GHz LAN: 8–25 MB/s.
+ *   The host emits 'multi-offer' and immediately begins ICE gathering.
+ *   ICE 'candidate' signals can arrive at the guest BEFORE the guest
+ *   has finished processing 'multi-offer' (i.e. before setRemoteDescription
+ *   is called on the matching PeerConnection).
  *
- * SIGNALLING CHANGE (host↔guest):
- *   Old: single 'offer' / 'answer' / 'ice' messages.
- *   New: 'multi-offer'  { sdps: [...N] }
- *        'multi-answer' { sdps: [...N] }
- *        'ice'          { pcIndex: N, candidate }
- *   The signalling relay (socket.io server) requires no changes —
- *   it still just forwards the 'signal' event payload unchanged.
+ *   addIceCandidate() throws InvalidStateError when remoteDescription is
+ *   null — exactly the error visible in the console:
+ *     "Failed to execute 'addIceCandidate' on 'RTCPeerConnection':
+ *      The remote description was null"
  *
- * ── What is NOT changed vs v15 ───────────────────────────────────
- *   • CHUNK_SIZE 128 KB                           — kept
- *   • BATCH_BYTES 32 MB disk-read batching        — kept
- *   • HIGH/LOW watermark per-channel flow control — kept
- *   • BURST_LIMIT + MessageChannel yield          — kept
- *   • O(1) #tryAssemble() counter check           — kept
- *   • Speed meter bufferedAmount correction       — kept
- *   • waitForFullDrain before 'done'              — kept
- *   • SDP bandwidth cap removal + max-message-size— kept
- *   • SpeedMeter EMA smoothing                   — kept
- *   • ICE stats logging                           — kept
+ *   The secondary 'sctp-failure: User-Initiated Abort' errors are a
+ *   knock-on effect: the broken PC is closed while chunks are in-flight.
+ *
+ * THE FIX — ICE candidate queuing (#pendingCandidates):
+ *   Any 'ice' signal that arrives before its PC has a remoteDescription
+ *   is pushed onto #pendingCandidates[]. Once #handleMultiOffer() (guest)
+ *   or the 'multi-answer' handler (host) finishes setting all remote
+ *   descriptions, the queue is drained and every buffered candidate is
+ *   applied in order. This eliminates the race completely.
+ *
+ * ── What is NOT changed vs v16 ───────────────────────────────────
+ *   • NUM_CONNECTIONS 6 independent RTCPeerConnections  — kept
+ *   • CHUNK_SIZE 128 KB                                 — kept
+ *   • BATCH_BYTES 32 MB disk-read batching              — kept
+ *   • HIGH/LOW watermark per-connection flow control    — kept
+ *   • BURST_LIMIT + MessageChannel yield                — kept
+ *   • O(1) #tryAssemble() counter check                 — kept
+ *   • Speed meter bufferedAmount correction             — kept
+ *   • waitForFullDrain before 'done'                    — kept
+ *   • SDP bandwidth cap removal + max-message-size      — kept
+ *   • SpeedMeter EMA smoothing                          — kept
+ *   • ICE stats logging                                 — kept
+ *   • multi-offer / multi-answer signalling protocol    — kept
  *
  * ── Expected performance ─────────────────────────────────────────
- *   Single PeerConnection (v14/v15):  1–1.5 MB/s
- *   6 PeerConnections   (v16):        8–25 MB/s on 5 GHz WiFi / LAN
- *                                      4–10 MB/s on 2.4 GHz WiFi
+ *   6 PeerConnections (v16/v17): 8–25 MB/s on 5 GHz WiFi / LAN
+ *                                 4–10 MB/s on 2.4 GHz WiFi
  *   Ceiling: DTLS encryption CPU + browser SCTP stack, not JS.
  */
 
@@ -56,9 +56,6 @@
  * Each PeerConnection is a separate SCTP association with its own cwnd.
  * 6 gives a good balance: 6× cwnd capacity without significant overhead.
  * Raising this beyond 8 shows diminishing returns on most hardware.
- *
- * (Previously called NUM_CHANNELS in v15, but that was a misnomer —
- *  DataChannels on the same PC share one cwnd.)
  */
 const NUM_CONNECTIONS = 6;
 
@@ -207,15 +204,21 @@ function yieldToChannel() {
 // ─── RipplePeer ───────────────────────────────────────────────────────────
 
 export class RipplePeer {
-  // v16: Array of independent PeerConnections (one per slot).
-  // Each #pcs[i] pairs with #dcs[i]. This is the key change from v15,
-  // where all channels lived on one shared #pc (and thus one shared cwnd).
+  // v16+: Array of independent PeerConnections (one per slot).
+  // Each #pcs[i] pairs with #dcs[i]. Each has its own SCTP association
+  // and congestion window, unlike v15 where all channels shared one PC.
   #pcs = [];   // Array<RTCPeerConnection>, length = NUM_CONNECTIONS
   #dcs = [];   // Array<RTCDataChannel>,   length = NUM_CONNECTIONS
 
   #role;
   #socket;
   #cb;
+
+  // ── v17: ICE candidate queue ─────────────────────────────────────────────
+  // ICE 'candidate' signals can arrive before setRemoteDescription() is
+  // called on the matching PeerConnection (race condition). Candidates are
+  // buffered here and drained once all remote descriptions are in place.
+  #pendingCandidates = []; // Array<{ pcIndex, candidate }>
 
   // ── Receiver state ──────────────────────────────────────────────────────
   #incomingMeta        = null;
@@ -325,12 +328,16 @@ export class RipplePeer {
    * 'multi-offer'  (guest receives from host):
    *   Create NUM_CONNECTIONS PeerConnections, set remote descriptions,
    *   register ondatachannel, create answers, send 'multi-answer'.
+   *   After all setRemoteDescription calls, drain #pendingCandidates.
    *
    * 'multi-answer' (host receives from guest):
    *   Set remote descriptions on existing PCs.
+   *   After all setRemoteDescription calls, drain #pendingCandidates.
    *
    * 'ice' (both sides):
-   *   Add ICE candidate to the PeerConnection identified by pcIndex.
+   *   If the target PC has a remoteDescription → apply immediately.
+   *   Otherwise → push onto #pendingCandidates for later drain.
+   *   This eliminates the InvalidStateError race condition (v17 fix).
    */
   async handleSignal(signal) {
     try {
@@ -345,15 +352,52 @@ export class RipplePeer {
             );
           }
         }
+        // Drain any ICE candidates that arrived before the answers were set
+        await this.#drainPendingCandidates();
 
       } else if (signal.type === 'ice' && signal.candidate) {
+        // ── v17 fix: guard against null remoteDescription ──────────────────
+        // ICE candidates often arrive before the corresponding SDP answer/offer
+        // has been set as the remote description. Applying them immediately
+        // throws InvalidStateError. We queue them and apply after the SDP
+        // exchange completes (#drainPendingCandidates).
         const pc = this.#pcs[signal.pcIndex];
-        if (pc) {
+        if (!pc || !pc.remoteDescription) {
+          this.#pendingCandidates.push({
+            pcIndex:   signal.pcIndex,
+            candidate: signal.candidate,
+          });
+        } else {
           await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
         }
       }
     } catch (e) {
       console.error('[Signal] Error:', e);
+    }
+  }
+
+  /**
+   * #drainPendingCandidates — apply all queued ICE candidates now that every
+   * PeerConnection has a remoteDescription set. Called after SDP negotiation
+   * completes on both host ('multi-answer' received) and guest ('multi-offer'
+   * processed).
+   *
+   * Candidates whose PC slot is still missing (shouldn't happen in normal
+   * flow, but guarded for safety) are silently discarded.
+   */
+  async #drainPendingCandidates() {
+    const pending = this.#pendingCandidates.splice(0); // drain atomically
+    for (const { pcIndex, candidate } of pending) {
+      const pc = this.#pcs[pcIndex];
+      if (!pc?.remoteDescription) continue; // safety guard
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn(`[ICE] Failed to apply queued candidate for pc${pcIndex}:`, e);
+      }
+    }
+    if (pending.length > 0) {
+      console.log(`[ICE] Drained ${pending.length} queued candidate(s)`);
     }
   }
 
@@ -364,6 +408,7 @@ export class RipplePeer {
    *   • ondatachannel handler to receive the DataChannel the host opened
    *   • an answer SDP
    * Sends all answers back as 'multi-answer'.
+   * Drains #pendingCandidates after all remote descriptions are set.
    */
   async #handleMultiOffer(sdps) {
     let openCount = 0;
@@ -402,6 +447,9 @@ export class RipplePeer {
       await pc.setLocalDescription({ type: answer.type, sdp: patchSdp(answer.sdp) });
       answers.push({ type: pc.localDescription.type, sdp: pc.localDescription.sdp });
     }
+
+    // All remote descriptions are now set — safe to apply queued candidates
+    await this.#drainPendingCandidates();
 
     this.#socket.emit('signal', { signal: { type: 'multi-answer', sdps: answers } });
   }
@@ -550,15 +598,15 @@ export class RipplePeer {
   /**
    * #sendOne — send a single file across NUM_CONNECTIONS DataChannels.
    *
-   * Chunk distribution (same round-robin as v15):
+   * Chunk distribution (round-robin across all connections):
    *   chunk seq=0  → dcs[0]  (on pcs[0], its own cwnd)
    *   chunk seq=1  → dcs[1]  (on pcs[1], its own cwnd)
    *   ...
    *   chunk seq=5  → dcs[5]  (on pcs[5], its own cwnd)
    *   chunk seq=6  → dcs[0]  ← wraps round-robin
    *
-   * Unlike v15, each dcs[i] now has a SEPARATE PeerConnection and thus
-   * a separate SCTP association with an independent congestion window.
+   * Each dcs[i] has a SEPARATE PeerConnection and thus a separate SCTP
+   * association with an independent congestion window.
    * All six cwnds grow in parallel and independently at the network level.
    *
    * 'done' is sent on dcs[0] only AFTER all connections have fully drained.
@@ -698,6 +746,7 @@ export class RipplePeer {
   // ── Cleanup ────────────────────────────────────────────────────────────────
 
   close() {
+    this.#pendingCandidates = [];
     this.#dcs.forEach(dc => { try { dc?.close(); } catch (_) {} });
     this.#pcs.forEach(pc => { try { pc?.close(); } catch (_) {} });
     this.#dcs = [];
