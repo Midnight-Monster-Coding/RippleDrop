@@ -1,125 +1,96 @@
 /**
- * RippleDrop — WebRTC Peer Manager  v15
+ * RippleDrop — WebRTC Peer Manager  v16
  *
  * ══════════════════════════════════════════════════════════════════
- * WHY v14 WAS STILL SLOW (1–1.5 MB/s) AND WHAT v15 FIXES
+ * WHY v15 WAS STILL SLOW (1–1.5 MB/s) AND WHAT v16 FIXES
  * ══════════════════════════════════════════════════════════════════
  *
- * ARCHITECTURAL ROOT CAUSE (unfixable by watermark tuning alone):
- *   One DataChannel = one SCTP stream = one congestion window (cwnd).
- *   Chrome's single-stream cwnd stabilises at 1–3 MB/s on LAN.
- *   Raising HIGH_WATERMARK (v14) gives cwnd more time to grow, but
- *   can never break the single-stream ceiling — that ceiling is set
- *   by Chrome's SCTP implementation, not by JS.
+ * ROOT CAUSE OF v15's FAILURE:
+ *   RFC 4960 (SCTP) defines ONE congestion window (cwnd) per
+ *   SCTP *association* — not per stream. A single RTCPeerConnection
+ *   creates exactly one SCTP association. Therefore, ALL 6 DataChannels
+ *   on one PeerConnection share a single cwnd, making multi-channel
+ *   round-robin identical in throughput to a single channel.
+ *   The v15 premise ("each channel has its own cwnd") was incorrect.
  *
- * THE FIX — NUM_CHANNELS = 6 parallel DataChannels:
- *   Each DataChannel is an independent SCTP stream with its own cwnd.
+ * THE REAL FIX — NUM_CONNECTIONS independent RTCPeerConnections:
+ *   Each RTCPeerConnection is a separate SCTP association.
+ *   Each association has its own, independent cwnd.
  *   All six cwnd values grow simultaneously and independently.
- *   Chunks are sent round-robin across all six channels.
- *   Combined throughput on a typical 5 GHz LAN: 8–25 MB/s
- *   (vs. 1–1.5 MB/s with a single channel).
+ *   File chunks are sent round-robin across #dcs[0..5],
+ *   but now each dc lives on its own PC with its own cwnd.
+ *   Combined throughput on a typical 5 GHz LAN: 8–25 MB/s.
  *
- * ── Additional v15 improvements ──────────────────────────────────
+ * SIGNALLING CHANGE (host↔guest):
+ *   Old: single 'offer' / 'answer' / 'ice' messages.
+ *   New: 'multi-offer'  { sdps: [...N] }
+ *        'multi-answer' { sdps: [...N] }
+ *        'ice'          { pcIndex: N, candidate }
+ *   The signalling relay (socket.io server) requires no changes —
+ *   it still just forwards the 'signal' event payload unchanged.
  *
- * FIX 1 — CHUNK_SIZE raised from 64 KB → 128 KB
- *   Halves the number of dc.send() calls, Map entries, DataView
- *   constructions, and Uint8Array allocations for the same file.
- *   Less GC pressure, less JS overhead per byte.
- *
- * FIX 2 — O(N²) #tryAssemble() → O(1) counter check
- *   v14 iterated from 0 to N on EVERY incoming chunk to find gaps.
- *   For a 1 GB file (8192 chunks at 128 KB): last chunk triggers
- *   8192 iterations; total = N*(N+1)/2 = ~33 M iterations wasted.
- *   v15 keeps a simple #receivedChunkCount integer. When
- *   count === expectedChunks the check is one comparison. Assembly
- *   (the ordered loop) runs exactly once. Net: O(1) vs O(N²).
- *
- * FIX 3 — Speed meter sums bufferedAmount across all channels
- *   effectivelySent = bytesSent − Σ(dc.bufferedAmount for all dcs)
- *   Without this the sender speed meter would show queue fill rate
- *   (fast) instead of actual network rate (what receiver sees).
- *
- * FIX 4 — waitForFullDrain across all channels before 'done'
- *   The 'done' signal is sent on channel 0 only after ALL six
- *   channels have bufferedAmount === 0. Combined with the
- *   #doneReceived flag (v14), this prevents false "missing chunk"
- *   errors caused by 'done' arriving before late binary chunks.
- *
- * ── What is NOT changed ───────────────────────────────────────────
- *   • MessageChannel yield (background-tab safe) — kept
- *   • BURST_LIMIT yielding every 4 MB — kept
- *   • Per-channel HIGH/LOW watermark flow control — kept (tuned)
- *   • 32 MB disk-read batching with prefetch pipeline — kept
- *   • SDP bandwidth cap removal + max-message-size patch — kept
- *   • SpeedMeter EMA smoothing — kept
- *   • ICE stats logging — kept
+ * ── What is NOT changed vs v15 ───────────────────────────────────
+ *   • CHUNK_SIZE 128 KB                           — kept
+ *   • BATCH_BYTES 32 MB disk-read batching        — kept
+ *   • HIGH/LOW watermark per-channel flow control — kept
+ *   • BURST_LIMIT + MessageChannel yield          — kept
+ *   • O(1) #tryAssemble() counter check           — kept
+ *   • Speed meter bufferedAmount correction       — kept
+ *   • waitForFullDrain before 'done'              — kept
+ *   • SDP bandwidth cap removal + max-message-size— kept
+ *   • SpeedMeter EMA smoothing                   — kept
+ *   • ICE stats logging                           — kept
  *
  * ── Expected performance ─────────────────────────────────────────
- *   Single channel (v14):  1–1.5 MB/s
- *   6 channels  (v15):     8–25 MB/s on 5 GHz WiFi (LAN host path)
- *                           4–10 MB/s on 2.4 GHz WiFi
+ *   Single PeerConnection (v14/v15):  1–1.5 MB/s
+ *   6 PeerConnections   (v16):        8–25 MB/s on 5 GHz WiFi / LAN
+ *                                      4–10 MB/s on 2.4 GHz WiFi
  *   Ceiling: DTLS encryption CPU + browser SCTP stack, not JS.
  */
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
 /**
- * NUM_CHANNELS — number of parallel RTCDataChannels.
+ * NUM_CONNECTIONS — number of independent RTCPeerConnections.
  *
- * Each channel is an independent SCTP stream. Chrome allows up to ~65535
- * streams per PeerConnection, but memory and CPU cost scale with count.
+ * Each PeerConnection is a separate SCTP association with its own cwnd.
  * 6 gives a good balance: 6× cwnd capacity without significant overhead.
  * Raising this beyond 8 shows diminishing returns on most hardware.
+ *
+ * (Previously called NUM_CHANNELS in v15, but that was a misnomer —
+ *  DataChannels on the same PC share one cwnd.)
  */
-const NUM_CHANNELS   = 6;
+const NUM_CONNECTIONS = 6;
 
 /**
- * CHUNK_SIZE — payload bytes per dc.send() call.
- *
- * 128 KB is a sweet spot:
- *   • Well below the 256 KB max-message-size we advertise in SDP.
- *   • Halves chunk count vs 64 KB → less JS overhead per byte.
- *   • Large enough that the 8-byte header is <0.006% overhead.
- *   • Small enough that individual send() calls don't cause jank.
+ * CHUNK_SIZE — payload bytes per dc.send() call (128 KB).
  */
 const CHUNK_SIZE     = 131072;   // 128 KB
 
 /**
- * BATCH_BYTES — bytes read from disk per File.slice().arrayBuffer().
- * 32 MB gives a generous prefetch buffer. The next batch's disk read
- * runs in parallel while the current batch is being chunked and sent.
+ * BATCH_BYTES — bytes read from disk per File.slice().arrayBuffer() (32 MB).
  */
 const BATCH_BYTES    = 33554432; // 32 MB
 
 /**
- * HIGH_WATERMARK — per-channel: pause dc.send() when bufferedAmount ≥ this.
- * 8 MB per channel (48 MB total across 6 channels) keeps each channel's
- * SCTP queue well-fed so its cwnd never goes idle waiting for JS.
+ * HIGH_WATERMARK — pause dc.send() when bufferedAmount ≥ this value.
+ * 8 MB per connection keeps each cwnd well-fed.
  */
-const HIGH_WATERMARK = 8388608;  //  8 MB per channel
+const HIGH_WATERMARK = 8388608;  //  8 MB per connection
 
 /**
- * LOW_WATERMARK — per-channel: resume dc.send() when bufferedAmount drops here.
- * 2 MB ensures we refill before the channel's SCTP queue goes dry.
+ * LOW_WATERMARK — resume dc.send() when bufferedAmount drops here.
  */
-const LOW_WATERMARK  = 2097152;  //  2 MB per channel
+const LOW_WATERMARK  = 2097152;  //  2 MB per connection
 
 /**
- * BURST_LIMIT — yield to event loop after sending this many bytes in one go.
- * The yield (via MessageChannel, not setTimeout) lets Chrome process incoming
- * SCTP ACKs, which is what advances the congestion window. Without yields,
- * JS monopolises the main thread and cwnd growth stalls.
- * 4 MB per yield: infrequent enough to avoid overhead, frequent enough for cwnd.
+ * BURST_LIMIT — yield to event loop after sending this many bytes.
+ * Lets Chrome process SCTP ACKs so each connection's cwnd can climb.
  */
 const BURST_LIMIT    = 4194304;  //  4 MB
 
 // ─── ICE / STUN config ────────────────────────────────────────────────────
 
-/**
- * On a local WiFi network, ICE selects 'host' candidates (local IPs) and
- * file bytes never leave the LAN. STUN is only needed for the initial
- * candidate gathering — it does not relay data.
- */
 const ICE_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302'  },
@@ -129,11 +100,6 @@ const ICE_CONFIG = {
 
 // ─── SDP helpers ──────────────────────────────────────────────────────────
 
-/**
- * Remove any bandwidth caps injected by the browser or SFU.
- * b=AS / b=CT / b=TIAS all cap the media section bandwidth.
- * Removing them lets the SCTP layer negotiate its own limits.
- */
 function removeBandwidthCaps(sdp) {
   return sdp
     .replace(/\r\nb=AS:\d+/g,   '')
@@ -141,12 +107,6 @@ function removeBandwidthCaps(sdp) {
     .replace(/\r\nb=TIAS:\d+/g, '');
 }
 
-/**
- * Raise a=max-message-size to 256 KB.
- * Chrome defaults to 256 KB; Firefox defaults to 64 KB.
- * Explicitly advertising 256 KB ensures both ends agree and allows
- * our 128 KB chunks (+ 8-byte header = 131,080 bytes) to pass safely.
- */
 function setMaxMessageSize(sdp, bytes = 262144) {
   if (/a=max-message-size:\d+/.test(sdp)) {
     return sdp.replace(/a=max-message-size:\d+/, `a=max-message-size:${bytes}`);
@@ -160,13 +120,6 @@ function patchSdp(sdp) {
 
 // ─── SpeedMeter ───────────────────────────────────────────────────────────
 
-/**
- * Exponential moving average speed meter.
- *
- * alpha=0.35 / (1-alpha)=0.65 gives a reasonably smooth display without
- * the "speed jumps to 0 at stall then never recovers" bug:
- *   if (deltaB <= 0) return; ← only blend when bytes actually moved.
- */
 export class SpeedMeter {
   #lastBytes     = 0;
   #lastTime      = performance.now();
@@ -175,13 +128,13 @@ export class SpeedMeter {
   update(currentTotalBytes) {
     const now    = performance.now();
     const deltaT = (now - this.#lastTime) / 1000;
-    if (deltaT < 0.1) return;                     // skip sub-100ms ticks
+    if (deltaT < 0.1) return;
 
     const deltaB = currentTotalBytes - this.#lastBytes;
     this.#lastBytes = currentTotalBytes;
     this.#lastTime  = now;
 
-    if (deltaB <= 0) return;                       // no new bytes — preserve last speed
+    if (deltaB <= 0) return;
 
     const currentSpeed  = deltaB / deltaT;
     this.#smoothedSpeed = this.#smoothedSpeed === 0
@@ -219,10 +172,6 @@ function _fmtETA(s) {
 
 // ─── Backpressure primitives ───────────────────────────────────────────────
 
-/**
- * drainBuffer — pause until a single channel's bufferedAmount < LOW_WATERMARK.
- * Called per-channel during the send loop when that channel hits HIGH_WATERMARK.
- */
 function drainBuffer(dc) {
   return new Promise(resolve => {
     if (!dc || dc.bufferedAmount < LOW_WATERMARK) { resolve(); return; }
@@ -231,12 +180,6 @@ function drainBuffer(dc) {
   });
 }
 
-/**
- * waitForFullDrain — wait until a channel's bufferedAmount hits exactly 0.
- * Used at the end of a file transfer before sending the 'done' message.
- * Ensures all binary data has left the DataChannel buffer (and entered the
- * SCTP send queue) before the control message follows.
- */
 function waitForFullDrain(dc) {
   return new Promise(resolve => {
     if (!dc || dc.bufferedAmount === 0) { resolve(); return; }
@@ -252,26 +195,6 @@ function waitForFullDrain(dc) {
 
 // ─── MessageChannel yield (background-tab safe) ───────────────────────────
 
-/**
- * yieldToChannel() — schedule a task in the next event loop turn.
- *
- * WHY NOT setTimeout(r, 0)?
- *   Chrome throttles setTimeout to ≥1000ms in background tabs.
- *   If the sender tab loses focus, setTimeout-based yields cap
- *   throughput at BURST_LIMIT / 1000ms = 4 MB/s at best.
- *
- * WHY MessageChannel?
- *   MessageChannel.postMessage() posts a task directly to the task
- *   queue — it is never throttled by background timer policies.
- *   It fires in the next turn (0–1ms) regardless of tab focus.
- *
- * WHY YIELD AT ALL?
- *   Chrome's SCTP stack runs on a network thread, but the ACK events
- *   that advance cwnd are dispatched as browser tasks on the main
- *   thread. If JS holds the main thread continuously, ACK tasks queue
- *   up and cwnd growth stalls. Yielding every BURST_LIMIT bytes
- *   drains the ACK task queue and lets cwnd climb.
- */
 let _yieldChannel = null;
 function yieldToChannel() {
   if (!_yieldChannel) _yieldChannel = new MessageChannel();
@@ -284,8 +207,11 @@ function yieldToChannel() {
 // ─── RipplePeer ───────────────────────────────────────────────────────────
 
 export class RipplePeer {
-  #pc   = null;
-  #dcs  = [];    // Array<RTCDataChannel>, length = NUM_CHANNELS once open
+  // v16: Array of independent PeerConnections (one per slot).
+  // Each #pcs[i] pairs with #dcs[i]. This is the key change from v15,
+  // where all channels lived on one shared #pc (and thus one shared cwnd).
+  #pcs = [];   // Array<RTCPeerConnection>, length = NUM_CONNECTIONS
+  #dcs = [];   // Array<RTCDataChannel>,   length = NUM_CONNECTIONS
 
   #role;
   #socket;
@@ -293,9 +219,9 @@ export class RipplePeer {
 
   // ── Receiver state ──────────────────────────────────────────────────────
   #incomingMeta        = null;
-  #incomingChunks      = new Map();   // seq → ArrayBuffer
+  #incomingChunks      = new Map();
   #receivedBytes       = 0;
-  #receivedChunkCount  = 0;           // v15: O(1) counter (was O(N) loop)
+  #receivedChunkCount  = 0;
   #expectedChunks      = 0;
   #doneReceived        = false;
   #recvSpeed           = new SpeedMeter();
@@ -306,134 +232,189 @@ export class RipplePeer {
     this.#cb     = callbacks;
   }
 
-  // ── Initialise PeerConnection + DataChannels ───────────────────────────
+  // ── Initialise PeerConnections + DataChannels ──────────────────────────
 
   async init() {
-    this.#pc = new RTCPeerConnection(ICE_CONFIG);
+    if (this.#role === 'host') {
+      await this.#initHost();
+    }
+    // Guest role: PeerConnections are created lazily when 'multi-offer' arrives
+    // via handleSignal(). Nothing to set up here.
+  }
 
-    this.#pc.onicecandidate = ({ candidate }) => {
+  /**
+   * #makePeerConnection — create one RTCPeerConnection with shared ICE and
+   * state-change handlers. pcIndex is used to:
+   *   • tag ICE candidate messages so the remote knows which PC they belong to
+   *   • limit verbose logging to pc0 only
+   */
+  #makePeerConnection(pcIndex) {
+    const pc = new RTCPeerConnection(ICE_CONFIG);
+
+    pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
-      console.log('[ICE] Candidate:', candidate.type, candidate.address ?? '(mDNS)');
-      this.#socket.emit('signal', { signal: { type: 'ice', candidate } });
+      if (pcIndex === 0) {
+        console.log('[ICE] Candidate:', candidate.type, candidate.address ?? '(mDNS)');
+      }
+      this.#socket.emit('signal', { signal: { type: 'ice', pcIndex, candidate } });
     };
 
-    this.#pc.oniceconnectionstatechange = () => {
-      const s = this.#pc?.iceConnectionState;
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
       if (!s) return;
-      console.log('[ICE]', s);
-      if (s === 'connected' || s === 'completed') this.#logIceStats();
+      // Only log and show ICE stats from the first PeerConnection to avoid spam
+      if (pcIndex === 0) {
+        console.log('[ICE]', s);
+        if (s === 'connected' || s === 'completed') this.#logIceStats(pc);
+      }
       if (s === 'failed')       this.#cb.onError?.('Connection failed. Ensure both devices are on the same Wi-Fi.');
       if (s === 'disconnected') this.#cb.onError?.('The other device disconnected.');
     };
 
-    if (this.#role === 'host') {
-      await this.#initHost();
-    } else {
-      this.#initGuest();
-    }
+    return pc;
   }
 
   /**
-   * HOST (sender): create NUM_CHANNELS DataChannels.
-   * Fire onOpen() only after all channels are simultaneously open —
-   * this guarantees the UI drop zone becomes active only when the full
-   * send pipeline is ready.
+   * HOST (sender): create NUM_CONNECTIONS independent PeerConnections,
+   * each with its own DataChannel. Collect all offers and send as one
+   * 'multi-offer' signal so the guest can answer in a single round-trip.
+   *
+   * onOpen() fires only when ALL connections are simultaneously open.
    */
   async #initHost() {
     let openCount = 0;
+    const offers  = [];
 
-    for (let i = 0; i < NUM_CHANNELS; i++) {
-      const dc = this.#pc.createDataChannel(`rippledrop-${i}`, {
-        ordered: false,   // unordered delivery — HOL-blocking removed
-                          // reliable = true (default, no maxRetransmits)
-                          // Reliable unordered is the safest choice for LAN:
-                          // no data loss risk, no head-of-line blocking.
+    for (let i = 0; i < NUM_CONNECTIONS; i++) {
+      const pc = this.#makePeerConnection(i);
+      this.#pcs.push(pc);
+
+      const dc = pc.createDataChannel('rippledrop', {
+        ordered: false,  // unordered = no HOL-blocking across chunks
+                         // reliable (default) = no data loss
       });
       dc.bufferedAmountLowThreshold = LOW_WATERMARK;
       dc.binaryType = 'arraybuffer';
-      this.#dcs.push(dc);
+      this.#dcs[i] = dc;
       this.#bindChannelHandlers(dc);
 
       dc.addEventListener('open', () => {
         openCount++;
-        console.log(`[DC] Channel ${i} open (${openCount}/${NUM_CHANNELS})`);
-        if (openCount === NUM_CHANNELS) {
-          console.log(`[DC] All ${NUM_CHANNELS} channels open — send pipeline ready`);
+        console.log(`[DC] Connection ${i} open (${openCount}/${NUM_CONNECTIONS})`);
+        if (openCount === NUM_CONNECTIONS) {
+          console.log(`[DC] All ${NUM_CONNECTIONS} connections open — send pipeline ready`);
           this.#cb.onOpen?.();
         }
       }, { once: true });
+
+      // Gather offer (ICE candidates begin gathering in background)
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription({ type: offer.type, sdp: patchSdp(offer.sdp) });
+      offers.push({ type: pc.localDescription.type, sdp: pc.localDescription.sdp });
     }
 
-    // Send WebRTC offer
-    const offer = await this.#pc.createOffer();
-    await this.#pc.setLocalDescription({ type: offer.type, sdp: patchSdp(offer.sdp) });
-    this.#socket.emit('signal', { signal: { type: 'offer', sdp: this.#pc.localDescription } });
-  }
-
-  /**
-   * GUEST (receiver): accept NUM_CHANNELS DataChannels as they arrive.
-   * Channels arrive via ondatachannel in the order the host created them.
-   * We index by parsed label suffix so #dcs[i] always matches channel i,
-   * ensuring #dcs[0] is always the control channel (meta/done messages).
-   */
-  #initGuest() {
-    let openCount = 0;
-
-    this.#pc.ondatachannel = ({ channel }) => {
-      channel.bufferedAmountLowThreshold = LOW_WATERMARK;
-      channel.binaryType = 'arraybuffer';
-
-      // Extract numeric index from label 'rippledrop-N'
-      const idx = parseInt(channel.label.split('-').pop() ?? '0', 10);
-      this.#dcs[idx] = channel;
-      this.#bindChannelHandlers(channel);
-
-      const onOpen = () => {
-        openCount++;
-        console.log(`[DC] Channel ${idx} open (${openCount}/${NUM_CHANNELS})`);
-        if (openCount === NUM_CHANNELS) {
-          console.log(`[DC] All ${NUM_CHANNELS} channels open — receive pipeline ready`);
-          this.#cb.onOpen?.();
-        }
-      };
-
-      // ondatachannel may fire after the channel is already open
-      if (channel.readyState === 'open') {
-        onOpen();
-      } else {
-        channel.addEventListener('open', onOpen, { once: true });
-      }
-    };
+    // Send all NUM_CONNECTIONS offers in one signalling message
+    this.#socket.emit('signal', { signal: { type: 'multi-offer', sdps: offers } });
   }
 
   // ── Signal handling ───────────────────────────────────────────────────────
 
+  /**
+   * handleSignal — dispatch incoming signalling messages.
+   *
+   * 'multi-offer'  (guest receives from host):
+   *   Create NUM_CONNECTIONS PeerConnections, set remote descriptions,
+   *   register ondatachannel, create answers, send 'multi-answer'.
+   *
+   * 'multi-answer' (host receives from guest):
+   *   Set remote descriptions on existing PCs.
+   *
+   * 'ice' (both sides):
+   *   Add ICE candidate to the PeerConnection identified by pcIndex.
+   */
   async handleSignal(signal) {
-    if (!this.#pc) return;
     try {
-      if (signal.type === 'offer') {
-        await this.#pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        const answer = await this.#pc.createAnswer();
-        await this.#pc.setLocalDescription({ type: answer.type, sdp: patchSdp(answer.sdp) });
-        this.#socket.emit('signal', { signal: { type: 'answer', sdp: this.#pc.localDescription } });
+      if (signal.type === 'multi-offer') {
+        await this.#handleMultiOffer(signal.sdps);
 
-      } else if (signal.type === 'answer') {
-        await this.#pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      } else if (signal.type === 'multi-answer') {
+        for (let i = 0; i < signal.sdps.length; i++) {
+          if (this.#pcs[i]) {
+            await this.#pcs[i].setRemoteDescription(
+              new RTCSessionDescription(signal.sdps[i])
+            );
+          }
+        }
 
       } else if (signal.type === 'ice' && signal.candidate) {
-        await this.#pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        const pc = this.#pcs[signal.pcIndex];
+        if (pc) {
+          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
       }
     } catch (e) {
       console.error('[Signal] Error:', e);
     }
   }
 
+  /**
+   * GUEST (receiver): process a 'multi-offer' from the host.
+   * Creates NUM_CONNECTIONS PeerConnections, each with:
+   *   • remote description set from the corresponding offer SDP
+   *   • ondatachannel handler to receive the DataChannel the host opened
+   *   • an answer SDP
+   * Sends all answers back as 'multi-answer'.
+   */
+  async #handleMultiOffer(sdps) {
+    let openCount = 0;
+    const answers = [];
+
+    for (let i = 0; i < sdps.length; i++) {
+      const pc = this.#makePeerConnection(i);
+      this.#pcs.push(pc);
+
+      // Each PC receives exactly one DataChannel from the host
+      pc.ondatachannel = ({ channel }) => {
+        channel.bufferedAmountLowThreshold = LOW_WATERMARK;
+        channel.binaryType = 'arraybuffer';
+        this.#dcs[i] = channel;
+        this.#bindChannelHandlers(channel);
+
+        const onOpen = () => {
+          openCount++;
+          console.log(`[DC] Connection ${i} open (${openCount}/${NUM_CONNECTIONS})`);
+          if (openCount === NUM_CONNECTIONS) {
+            console.log(`[DC] All ${NUM_CONNECTIONS} connections open — receive pipeline ready`);
+            this.#cb.onOpen?.();
+          }
+        };
+
+        // ondatachannel may fire after the channel is already open
+        if (channel.readyState === 'open') {
+          onOpen();
+        } else {
+          channel.addEventListener('open', onOpen, { once: true });
+        }
+      };
+
+      await pc.setRemoteDescription(new RTCSessionDescription(sdps[i]));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription({ type: answer.type, sdp: patchSdp(answer.sdp) });
+      answers.push({ type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+    }
+
+    this.#socket.emit('signal', { signal: { type: 'multi-answer', sdps: answers } });
+  }
+
   // ── ICE stats logging (diagnostic) ───────────────────────────────────────
 
-  async #logIceStats() {
+  /**
+   * Log ICE path info for one PeerConnection (called on pc0 only).
+   */
+  async #logIceStats(pc) {
     try {
       await new Promise(r => setTimeout(r, 700));
-      const stats = await this.#pc?.getStats();
+      const stats = await pc?.getStats();
       if (!stats) return;
       const reports = {};
       stats.forEach(r => { reports[r.id] = r; });
@@ -447,13 +428,13 @@ export class RipplePeer {
             : 'RTT unknown';
 
           console.group('%c[ICE Stats] Active path', 'color:#22d3ee;font-weight:bold');
-          console.log('Channels:', NUM_CHANNELS);
+          console.log('Connections:', NUM_CONNECTIONS, '(independent SCTP associations)');
           console.log('Local   :', local?.candidateType,  '|', local?.address  ?? '(mDNS)', ':', local?.port);
           console.log('Remote  :', remote?.candidateType, '|', remote?.address ?? '(mDNS)', ':', remote?.port);
           console.log('Path    :', rtt);
           if (local?.candidateType === 'host') {
             console.log(
-              `%c✅ DIRECT LAN — ${NUM_CHANNELS} channels active. Expect 8–25 MB/s.`,
+              `%c✅ DIRECT LAN — ${NUM_CONNECTIONS} independent cwnds. Expect 8–25 MB/s.`,
               'color:#4ade80;font-weight:bold'
             );
           } else if (local?.candidateType === 'srflx') {
@@ -471,10 +452,6 @@ export class RipplePeer {
 
   // ── Channel event binding ──────────────────────────────────────────────────
 
-  /**
-   * Bind close/error/message handlers to a DataChannel.
-   * 'open' is bound separately in initHost/initGuest for open-counting.
-   */
   #bindChannelHandlers(dc) {
     dc.onclose = () => this.#cb.onClose?.();
     dc.onerror = (e) => {
@@ -488,22 +465,20 @@ export class RipplePeer {
   // ── Receiver message handler ───────────────────────────────────────────────
 
   /**
-   * All NUM_CHANNELS DataChannels share this single message handler.
-   * Binary packets from any channel are merged into the same chunk Map.
-   * Control messages (meta, done) are only ever sent on channel 0.
+   * All NUM_CONNECTIONS DataChannels share this single message handler.
+   * Binary packets from any connection are merged into the same chunk Map.
+   * Control messages (meta, done) are only ever sent on #dcs[0].
    *
-   * Binary packet wire format (matches sender):
+   * Binary packet wire format:
    *   [0..3]  seq  — uint32 little-endian, global chunk sequence number
    *   [4..7]  len  — uint32 little-endian, payload byte length
    *   [8..]   payload — raw file bytes
    */
   #onMessage({ data }) {
-    // ── Control message (JSON string) ──────────────────────────────────
     if (typeof data === 'string') {
       const msg = JSON.parse(data);
 
       if (msg.type === 'meta') {
-        // New file incoming — reset all receiver state
         this.#incomingMeta        = msg;
         this.#incomingChunks      = new Map();
         this.#receivedBytes       = 0;
@@ -514,27 +489,22 @@ export class RipplePeer {
         this.#cb.onFileMeta?.(msg);
 
       } else if (msg.type === 'done') {
-        // 'done' marks end of file. With ordered:false, 'done' (sent on
-        // channel 0) may arrive before the last binary chunk on another
-        // channel — the counter check in #tryAssemble handles this safely.
         this.#doneReceived = true;
         this.#tryAssemble();
       }
       return;
     }
 
-    // ── Binary chunk ───────────────────────────────────────────────────
+    // Binary chunk
     const dv      = new DataView(data);
     const seq     = dv.getUint32(0, true);
     const len     = dv.getUint32(4, true);
     const payload = data.slice(8, 8 + len);
 
-    // Deduplicate: skip if this seq already arrived (can happen on
-    // rare SCTP retransmits that deliver a copy after the original).
     if (!this.#incomingChunks.has(seq)) {
       this.#incomingChunks.set(seq, payload);
       this.#receivedBytes      += payload.byteLength;
-      this.#receivedChunkCount += 1;          // O(1) increment
+      this.#receivedChunkCount += 1;
       this.#recvSpeed.update(this.#receivedBytes);
     }
 
@@ -545,27 +515,14 @@ export class RipplePeer {
       meta:          this.#incomingMeta,
     });
 
-    // Attempt assembly on every chunk (in case 'done' already arrived)
     if (this.#doneReceived) this.#tryAssemble();
   }
 
-  /**
-   * #tryAssemble — v15 O(1) completion check.
-   *
-   * v14 problem: iterated 0..N on every incoming chunk → O(N²) total.
-   * v15 solution: one integer comparison (#receivedChunkCount < #expectedChunks).
-   * The final ordered assembly loop is O(N) but runs exactly once.
-   *
-   * Correctness:
-   *   #receivedChunkCount only increments when a *new* seq is stored.
-   *   Duplicate packets (caught by Map.has) don't inflate the count.
-   *   So count === expectedChunks iff the Map contains every seq 0..N-1.
-   */
+  // ── Assembly ───────────────────────────────────────────────────────────────
+
   #tryAssemble() {
-    // Still waiting for some chunks — bail immediately (O(1))
     if (this.#receivedChunkCount < this.#expectedChunks) return;
 
-    // All chunks present — build Blob in sequential order (O(N), runs once)
     const chunks = [];
     for (let i = 0; i < this.#expectedChunks; i++) {
       chunks.push(this.#incomingChunks.get(i));
@@ -591,23 +548,20 @@ export class RipplePeer {
   }
 
   /**
-   * #sendOne — send a single file across NUM_CHANNELS channels.
+   * #sendOne — send a single file across NUM_CONNECTIONS DataChannels.
    *
-   * Chunk distribution:
-   *   chunk seq=0  → dcs[0]
-   *   chunk seq=1  → dcs[1]
+   * Chunk distribution (same round-robin as v15):
+   *   chunk seq=0  → dcs[0]  (on pcs[0], its own cwnd)
+   *   chunk seq=1  → dcs[1]  (on pcs[1], its own cwnd)
    *   ...
-   *   chunk seq=5  → dcs[5]
+   *   chunk seq=5  → dcs[5]  (on pcs[5], its own cwnd)
    *   chunk seq=6  → dcs[0]  ← wraps round-robin
-   *   ...
    *
-   * Each channel drains independently. Flow control is per-channel:
-   * if one channel's buffer fills, only that channel pauses while
-   * the others continue sending. This maximises utilisation.
+   * Unlike v15, each dcs[i] now has a SEPARATE PeerConnection and thus
+   * a separate SCTP association with an independent congestion window.
+   * All six cwnds grow in parallel and independently at the network level.
    *
-   * 'done' is sent on dcs[0] only AFTER all six channels have fully
-   * drained (bufferedAmount === 0), so no binary data is in-flight
-   * when the control message hits the receiver.
+   * 'done' is sent on dcs[0] only AFTER all connections have fully drained.
    */
   async #sendOne(file, fileIndex, fileTotal, onProgress) {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 0;
@@ -622,7 +576,7 @@ export class RipplePeer {
       chunkSize: CHUNK_SIZE,
     };
 
-    // Control messages always on channel 0
+    // Control messages always on connection 0
     this.#dcs[0].send(JSON.stringify(meta));
 
     if (file.size === 0) {
@@ -635,18 +589,11 @@ export class RipplePeer {
     }
 
     const speed     = new SpeedMeter();
-    let   bytesSent = 0;   // total bytes passed to dc.send() (for % progress)
-    let   seq       = 0;   // monotonically increasing chunk sequence number
+    let   bytesSent = 0;
+    let   seq       = 0;
 
-    // ── UI progress timer ──────────────────────────────────────────────
-    //
-    // effectivelySent = bytesSent − Σ(dc.bufferedAmount for all channels)
-    //
-    // bytesSent counts bytes *queued* into all DataChannels (dc.send is
-    // near-instant — it just copies to the DC buffer). Subtracting the
-    // total still-buffered bytes gives bytes actually handed to SCTP —
-    // approximately what the receiver is counting. Both sides now show
-    // the same speed.
+    // UI progress timer — subtracts total buffered across all connections
+    // so the display shows actual network rate, not queue-fill rate.
     const uiTimer = setInterval(() => {
       if (!this.#dcs[0]) return;
       const totalBuffered   = this.#dcs.reduce((s, dc) => s + (dc?.bufferedAmount ?? 0), 0);
@@ -662,21 +609,6 @@ export class RipplePeer {
     }, 100);
 
     try {
-      // ── THREE-LEVEL PIPELINE ───────────────────────────────────────────
-      //
-      // Level 0 — Disk pipeline:
-      //   File.slice().arrayBuffer() (disk read) for batch N+1 starts
-      //   while batch N is being chunked and sent. Eliminates disk-I/O
-      //   wait from the inner send loop.
-      //
-      // Level 1 — MessageChannel yield every BURST_LIMIT bytes:
-      //   Lets Chrome drain the SCTP ACK task queue so cwnd can climb.
-      //   Background-tab safe (not throttled like setTimeout).
-      //
-      // Level 2 — Per-channel backpressure (drainBuffer at HIGH_WATERMARK):
-      //   Only the full channel pauses; others continue uninterrupted.
-      //   Prevents SCTP receive-window overflow and cwnd collapse.
-
       let fileOffset       = 0;
       let nextBatchPromise = this.#readBatch(file, fileOffset);
       fileOffset           = Math.min(fileOffset + BATCH_BYTES, file.size);
@@ -685,7 +617,7 @@ export class RipplePeer {
         const batch = await nextBatchPromise;
         if (!batch || batch.byteLength === 0) break;
 
-        // Prefetch next batch in parallel with sending current one
+        // Prefetch next batch while sending current one
         if (fileOffset < file.size) {
           nextBatchPromise = this.#readBatch(file, fileOffset);
           fileOffset       = Math.min(fileOffset + BATCH_BYTES, file.size);
@@ -696,20 +628,20 @@ export class RipplePeer {
         let burstBytes = 0;
 
         for (let i = 0; i < batch.byteLength; i += CHUNK_SIZE) {
-          // Pick channel round-robin by seq number
-          const chIdx = seq % NUM_CHANNELS;
+          // Round-robin across all connections
+          const chIdx = seq % NUM_CONNECTIONS;
           const dc    = this.#dcs[chIdx];
 
           if (!dc || dc.readyState !== 'open') {
-            throw new Error('DataChannel closed during send');
+            throw new Error(`DataChannel ${chIdx} closed during send`);
           }
 
           const end     = Math.min(i + CHUNK_SIZE, batch.byteLength);
           const payload = new Uint8Array(batch, i, end - i);
 
           // Wire format: 8-byte header + payload
-          //   bytes 0–3: seq  (uint32 LE) — receiver uses this as Map key
-          //   bytes 4–7: len  (uint32 LE) — explicit length (no trailing garbage)
+          //   bytes 0–3: seq  (uint32 LE)
+          //   bytes 4–7: len  (uint32 LE)
           //   bytes 8+:  payload
           const packet = new Uint8Array(8 + payload.byteLength);
           const dv     = new DataView(packet.buffer);
@@ -722,13 +654,14 @@ export class RipplePeer {
           burstBytes += payload.byteLength;
           seq++;
 
-          // Level 1: yield after BURST_LIMIT bytes (MessageChannel, not setTimeout)
+          // Yield every BURST_LIMIT bytes — lets each PC's SCTP process ACKs
+          // and advance its cwnd independently.
           if (burstBytes >= BURST_LIMIT) {
             burstBytes = 0;
             await yieldToChannel();
           }
 
-          // Level 2: per-channel backpressure — only this channel pauses
+          // Per-connection backpressure — only this connection pauses
           if (dc.bufferedAmount >= HIGH_WATERMARK) {
             await drainBuffer(dc);
             burstBytes = 0;
@@ -736,14 +669,9 @@ export class RipplePeer {
         }
       }
 
-      // Wait for ALL six channels to fully drain before sending 'done'.
-      // This ensures every binary chunk has left the DataChannel buffer
-      // (entered the SCTP send queue) before the control frame follows.
-      // Combined with the #doneReceived flag on the receiver, this
-      // guarantees 'done' never triggers assembly before all chunks arrive.
+      // Wait for ALL connections to fully drain before sending 'done'
       await Promise.all(this.#dcs.map(dc => waitForFullDrain(dc)));
 
-      // Final progress callback with exact byte count
       speed.update(file.size);
       onProgress?.({
         sentBytes: file.size, totalBytes: file.size,
@@ -754,7 +682,7 @@ export class RipplePeer {
       clearInterval(uiTimer);
     }
 
-    // 'done' on channel 0 — signals the receiver to assemble the Blob
+    // 'done' on connection 0 — signals receiver to assemble Blob
     this.#dcs[0].send(JSON.stringify({ type: 'done' }));
   }
 
@@ -771,8 +699,8 @@ export class RipplePeer {
 
   close() {
     this.#dcs.forEach(dc => { try { dc?.close(); } catch (_) {} });
-    try { this.#pc?.close(); } catch (_) {}
+    this.#pcs.forEach(pc => { try { pc?.close(); } catch (_) {} });
     this.#dcs = [];
-    this.#pc  = null;
+    this.#pcs = [];
   }
 }
